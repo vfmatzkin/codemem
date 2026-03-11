@@ -350,6 +350,33 @@ impl Storage {
         Ok(namespaces)
     }
 
+    /// Rename a namespace across all tables atomically.
+    /// Returns the total number of rows updated.
+    pub fn rename_namespace(&self, from: &str, to: &str) -> Result<usize, CodememError> {
+        let conn = self.conn()?;
+        let tables = [
+            "memories",
+            "graph_nodes",
+            "sessions",
+            "repositories",
+            "package_registry",
+            "unresolved_refs",
+            "api_endpoints",
+            "api_client_calls",
+        ];
+        let tx = conn.unchecked_transaction().storage_err()?;
+        let mut total = 0usize;
+        for table in &tables {
+            let sql = format!("UPDATE {table} SET namespace = ?1 WHERE namespace = ?2");
+            let changed = tx
+                .execute(&sql, rusqlite::params![to, from])
+                .storage_err()?;
+            total += changed;
+        }
+        tx.commit().storage_err()?;
+        Ok(total)
+    }
+
     /// Get memory count.
     pub fn memory_count(&self) -> Result<usize, CodememError> {
         let conn = self.conn()?;

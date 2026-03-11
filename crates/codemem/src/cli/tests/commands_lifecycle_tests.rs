@@ -1,33 +1,152 @@
+use super::super::namespace_from_path;
 use super::*;
 
-// ── namespace_from_cwd ──────────────────────────────────────────────
+/// Build a git Command with author/committer env vars set for CI safety.
+fn git_cmd(repo_dir: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(repo_dir)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test");
+    cmd
+}
+
+// ── namespace_from_path (git_aware=false, baseline) ─────────────────
 
 #[test]
-fn namespace_from_cwd_absolute_path() {
-    assert_eq!(namespace_from_cwd("/Users/me/project"), "project");
+fn namespace_from_path_absolute() {
+    assert_eq!(namespace_from_path("/Users/me/project", false), "project");
 }
 
 #[test]
-fn namespace_from_cwd_nested_path() {
-    assert_eq!(namespace_from_cwd("/home/user/deep/nested/repo"), "repo");
+fn namespace_from_path_nested() {
+    assert_eq!(
+        namespace_from_path("/home/user/deep/nested/repo", false),
+        "repo"
+    );
 }
 
 #[test]
-fn namespace_from_cwd_single_component() {
-    assert_eq!(namespace_from_cwd("myproject"), "myproject");
+fn namespace_from_path_single_component() {
+    assert_eq!(namespace_from_path("myproject", false), "myproject");
 }
 
 #[test]
-fn namespace_from_cwd_trailing_slash() {
-    // Path::file_name() strips trailing slashes on Unix
-    assert_eq!(namespace_from_cwd("/Users/me/project/"), "project");
+fn namespace_from_path_trailing_slash() {
+    assert_eq!(namespace_from_path("/Users/me/project/", false), "project");
 }
 
 #[test]
-fn namespace_from_cwd_root() {
-    // Path::new("/").file_name() returns None → unwrap_or(cwd) returns "/"
-    // This is a known edge case: "/" is a poor namespace but won't panic.
-    assert_eq!(namespace_from_cwd("/"), "/");
+fn namespace_from_path_root() {
+    assert_eq!(namespace_from_path("/", false), "/");
+}
+
+// ── namespace_from_path (git_aware=true, non-git dir) ───────────────
+
+#[test]
+fn namespace_non_git_dir_falls_back_to_basename() {
+    // /tmp is not a git repo, so git_aware should fall back to basename
+    assert_eq!(namespace_from_path("/tmp", true), "tmp");
+}
+
+// ── git_branch ──────────────────────────────────────────────────────
+
+#[test]
+fn git_branch_non_git_dir_returns_none() {
+    assert!(super::super::git_branch("/tmp").is_none());
+}
+
+// ── namespace_from_path (git_aware=true, real repos) ────────────────
+
+#[test]
+fn namespace_regular_repo_returns_basename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("my-project");
+    std::fs::create_dir(&repo_dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    let ns = namespace_from_path(repo_dir.to_str().unwrap(), true);
+    assert_eq!(ns, "my-project");
+}
+
+#[test]
+fn namespace_worktree_resolves_to_main_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_dir = tmp.path().join("main-repo");
+    std::fs::create_dir(&main_dir).unwrap();
+
+    // Init repo with an initial commit (worktree requires a commit)
+    git_cmd(&main_dir).args(["init"]).output().unwrap();
+    git_cmd(&main_dir)
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .output()
+        .unwrap();
+
+    // Create a worktree
+    let wt_dir = tmp.path().join("worktree-checkout");
+    let wt_result = git_cmd(&main_dir)
+        .args([
+            "worktree",
+            "add",
+            wt_dir.to_str().unwrap(),
+            "-b",
+            "feature-branch",
+        ])
+        .output()
+        .unwrap();
+    if !wt_result.status.success() {
+        // Skip on environments where git worktree isn't available
+        eprintln!("Skipping worktree test: git worktree add failed");
+        return;
+    }
+
+    // Both should resolve to the same namespace
+    let ns_main = namespace_from_path(main_dir.to_str().unwrap(), true);
+    let ns_wt = namespace_from_path(wt_dir.to_str().unwrap(), true);
+    assert_eq!(
+        ns_main, ns_wt,
+        "worktree and main repo should share namespace"
+    );
+    assert_eq!(ns_main, "main-repo");
+}
+
+#[test]
+fn git_branch_returns_tag_for_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("branch-test");
+    std::fs::create_dir(&repo_dir).unwrap();
+    git_cmd(&repo_dir)
+        .args(["init", "-b", "my-feature"])
+        .output()
+        .unwrap();
+    git_cmd(&repo_dir)
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .output()
+        .unwrap();
+
+    let branch = super::super::git_branch(repo_dir.to_str().unwrap());
+    assert_eq!(branch, Some("branch:my-feature".to_string()));
+}
+
+#[test]
+fn namespace_git_aware_false_skips_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("skip-git-test");
+    std::fs::create_dir(&repo_dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // git_aware=false should still return basename, but skip git commands
+    let ns = namespace_from_path(repo_dir.to_str().unwrap(), false);
+    assert_eq!(ns, "skip-git-test");
 }
 
 // ── short_path ──────────────────────────────────────────────────────
@@ -938,4 +1057,67 @@ fn checkpoint_batch_size_is_bounded() {
         item_count <= 5,
         "checkpoint should include at most 5 key items, got {item_count}"
     );
+}
+
+// ── rename_namespace ───────────────────────────────────────────────
+
+#[test]
+fn rename_namespace_moves_memories_and_sessions() {
+    let storage = codemem_engine::Storage::open_in_memory().unwrap();
+
+    // Create memories in the old namespace
+    for i in 0..3 {
+        let mut m = codemem_core::MemoryNode::test_default(&format!("memory {i}"));
+        m.id = format!("rn-{i}");
+        m.namespace = Some("old-name".to_string());
+        storage.insert_memory(&m).unwrap();
+    }
+
+    // Create a session in the old namespace
+    storage.start_session("rn-sess", Some("old-name")).unwrap();
+
+    // Verify old namespace has data
+    assert_eq!(
+        storage
+            .list_memory_ids_for_namespace("old-name")
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Rename
+    let count = storage.rename_namespace("old-name", "new-name").unwrap();
+    assert!(count >= 4, "should update at least 3 memories + 1 session");
+
+    // Old namespace is empty
+    assert!(
+        storage
+            .list_memory_ids_for_namespace("old-name")
+            .unwrap()
+            .is_empty()
+    );
+
+    // New namespace has everything
+    assert_eq!(
+        storage
+            .list_memory_ids_for_namespace("new-name")
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Session moved too
+    let sessions = codemem_core::StorageBackend::list_sessions(&storage, Some("new-name"), 10)
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "rn-sess");
+}
+
+#[test]
+fn rename_namespace_noop_if_not_found() {
+    let storage = codemem_engine::Storage::open_in_memory().unwrap();
+    let count = storage
+        .rename_namespace("nonexistent", "whatever")
+        .unwrap();
+    assert_eq!(count, 0);
 }

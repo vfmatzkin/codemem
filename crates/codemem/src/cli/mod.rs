@@ -157,6 +157,12 @@ enum Commands {
         action: SessionAction,
     },
 
+    /// Manage namespaces
+    Namespace {
+        #[command(subcommand)]
+        action: NamespaceAction,
+    },
+
     /// Run health checks on the Codemem installation
     Doctor,
 
@@ -231,6 +237,19 @@ enum SessionAction {
         /// Optional summary of what was accomplished
         #[arg(short, long)]
         summary: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NamespaceAction {
+    /// List all namespaces
+    List,
+    /// Rename a namespace (updates all memories, sessions, graph nodes, etc.)
+    Rename {
+        /// Current namespace name
+        from: String,
+        /// New namespace name
+        to: String,
     },
 }
 
@@ -356,6 +375,26 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Namespace { action } => {
+            let db_path = codemem_db_path();
+            let storage = codemem_engine::Storage::open(&db_path)?;
+            match action {
+                NamespaceAction::List => {
+                    let namespaces = storage.list_namespaces()?;
+                    if namespaces.is_empty() {
+                        println!("No namespaces found.");
+                    } else {
+                        for ns in &namespaces {
+                            println!("{ns}");
+                        }
+                    }
+                }
+                NamespaceAction::Rename { from, to } => {
+                    let count = storage.rename_namespace(&from, &to)?;
+                    println!("Renamed namespace \"{from}\" → \"{to}\" ({count} rows updated)");
+                }
+            }
+        }
         Commands::Context => {
             // H3: Open lightweight storage instead of the full engine.
             let db_path = codemem_db_path();
@@ -401,12 +440,75 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 /// Derive a short namespace from a working-directory path.
-/// Returns the directory basename (e.g. `/Users/me/project` → `"project"`).
-pub(crate) fn namespace_from_path(path: &str) -> &str {
+///
+/// When `git_aware` is true, resolves git worktrees to the main repo's
+/// basename so all worktrees share a single namespace. Falls back to
+/// directory basename if not a git repo or git is unavailable.
+pub(crate) fn namespace_from_path(path: &str, git_aware: bool) -> String {
+    if git_aware {
+        if let Some(ns) = git_namespace(path) {
+            return ns;
+        }
+    }
     std::path::Path::new(path)
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(path)
+        .to_string()
+}
+
+fn git_namespace(path: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", path, "rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let git_common_dir = std::str::from_utf8(&output.stdout).ok()?.trim();
+
+    if git_common_dir == ".git" {
+        // Regular repo — basename of path
+        std::path::Path::new(path)
+            .file_name()?
+            .to_str()
+            .map(|s| s.to_string())
+    } else if git_common_dir == "." {
+        // Bare repo — fall back
+        None
+    } else {
+        // Worktree — resolve to main repo's basename
+        let common = std::path::Path::new(git_common_dir);
+        let common = if common.is_relative() {
+            std::path::Path::new(path)
+                .join(common)
+                .canonicalize()
+                .ok()?
+        } else {
+            common.to_path_buf()
+        };
+        // common is the .git dir; parent is the repo root
+        common
+            .parent()?
+            .file_name()?
+            .to_str()
+            .map(|s| s.to_string())
+    }
+}
+
+pub(crate) fn git_branch(path: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(format!("branch:{branch}"))
 }
 
 /// Return the system-wide Codemem database path: ~/.codemem/codemem.db

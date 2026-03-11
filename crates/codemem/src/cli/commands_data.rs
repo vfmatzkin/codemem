@@ -181,9 +181,10 @@ pub(crate) fn cmd_ingest() -> anyhow::Result<()> {
             };
 
         // Use directory basename as namespace (not full path)
+        let git_aware = engine.config().namespace.git_aware;
         let namespace = std::env::current_dir()
             .ok()
-            .map(|p| super::namespace_from_path(&p.to_string_lossy()).to_string());
+            .map(|p| super::namespace_from_path(&p.to_string_lossy(), git_aware));
 
         let mut memory = codemem_core::MemoryNode::new(content.clone(), extracted.memory_type);
         let id = memory.id.clone();
@@ -679,7 +680,11 @@ fn flush_batch(
     memory.importance = importance;
     memory.tags = tags;
     memory.metadata = metadata;
-    memory.namespace = Some(super::namespace_from_path(&watch_dir.to_string_lossy()).to_string());
+    let git_aware = engine.config().namespace.git_aware;
+    memory.namespace = Some(super::namespace_from_path(
+        &watch_dir.to_string_lossy(),
+        git_aware,
+    ));
 
     let stored = match engine.persist_memory(&memory) {
         Ok(()) => {
@@ -707,7 +712,7 @@ fn flush_batch(
 
     // Trigger incremental graph update for each changed/created/deleted file
     let watch_dir_str = watch_dir.to_string_lossy();
-    let namespace = super::namespace_from_path(&watch_dir_str);
+    let namespace = super::namespace_from_path(&watch_dir_str, git_aware);
     for change in batch {
         let event = match change.event_type {
             "modified" => codemem_engine::watch::WatchEvent::FileChanged(
@@ -721,7 +726,7 @@ fn flush_batch(
             ),
             _ => continue,
         };
-        if let Err(e) = engine.process_watch_event(&event, Some(namespace), Some(watch_dir)) {
+        if let Err(e) = engine.process_watch_event(&event, Some(&namespace), Some(watch_dir)) {
             tracing::warn!("Incremental index failed for {}: {e}", change.relative_path);
         }
     }

@@ -11,7 +11,10 @@ pub mod utils;
 pub use utils::truncate;
 
 // ── config ──────────────────────────────────────────────────────────────────
-pub use config::{ChunkingConfig, CodememConfig, EmbeddingConfig, EnrichmentConfig, StorageConfig};
+pub use config::{
+    ChunkingConfig, CodememConfig, EmbeddingConfig, EnrichmentConfig, NamespaceConfig,
+    StorageConfig,
+};
 
 // ── error ───────────────────────────────────────────────────────────────────
 pub use error::CodememError;

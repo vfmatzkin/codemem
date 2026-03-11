@@ -269,6 +269,15 @@ pub trait StorageBackend: Send + Sync {
     /// List all distinct namespaces.
     fn list_namespaces(&self) -> Result<Vec<String>, CodememError>;
 
+    /// Rename a namespace across all tables (memories, graph_nodes, sessions, etc.).
+    /// Returns the number of rows updated.
+    fn rename_namespace(&self, from: &str, to: &str) -> Result<usize, CodememError> {
+        let _ = (from, to);
+        Err(CodememError::Config(
+            "rename_namespace not implemented".to_string(),
+        ))
+    }
+
     /// Get total memory count.
     fn memory_count(&self) -> Result<usize, CodememError>;
 

@@ -17,6 +17,7 @@ pub struct CodememConfig {
     pub storage: StorageConfig,
     pub chunking: ChunkingConfig,
     pub enrichment: EnrichmentConfig,
+    pub namespace: NamespaceConfig,
 }
 
 impl CodememConfig {
@@ -284,6 +285,16 @@ impl Default for EnrichmentConfig {
             dedup_similarity_threshold: 0.90,
         }
     }
+}
+
+/// Namespace resolution configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamespaceConfig {
+    /// Use git to resolve worktrees to main repo. Default: false.
+    pub git_aware: bool,
+    /// Store current branch as a tag on memories. Default: false.
+    pub tag_branch: bool,
 }
 
 #[cfg(test)]

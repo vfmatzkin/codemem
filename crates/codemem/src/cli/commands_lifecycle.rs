@@ -1,13 +1,8 @@
 //! Sessions & lifecycle hook commands.
 
-use codemem_core::StorageBackend;
+use codemem_core::{CodememConfig, StorageBackend};
 
-use super::namespace_from_path;
-
-/// Alias for backwards compatibility within this module.
-fn namespace_from_cwd(cwd: &str) -> &str {
-    namespace_from_path(cwd)
-}
+use super::{git_branch, namespace_from_path};
 
 // ── Sessions Commands ─────────────────────────────────────────────────────
 
@@ -102,17 +97,26 @@ fn read_hook_payload() -> serde_json::Value {
 /// Common fields extracted from every hook payload.
 struct HookContext<'a> {
     session_id: &'a str,
-    namespace: Option<&'a str>,
+    namespace: Option<String>,
+    branch_tag: Option<String>,
 }
 
 /// Extract the common session_id / cwd / namespace fields from a payload.
-/// The returned references borrow from `payload`.
-fn extract_hook_context(payload: &serde_json::Value) -> HookContext<'_> {
+fn extract_hook_context<'a>(
+    payload: &'a serde_json::Value,
+    config: &CodememConfig,
+) -> HookContext<'a> {
     let cwd_raw = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let namespace = if cwd_raw.is_empty() {
-        None
+    let (namespace, branch_tag) = if cwd_raw.is_empty() {
+        (None, None)
     } else {
-        Some(namespace_from_cwd(cwd_raw))
+        let ns = namespace_from_path(cwd_raw, config.namespace.git_aware);
+        let bt = if config.namespace.tag_branch {
+            git_branch(cwd_raw)
+        } else {
+            None
+        };
+        (Some(ns), bt)
     };
     let session_id = payload
         .get("session_id")
@@ -121,6 +125,7 @@ fn extract_hook_context(payload: &serde_json::Value) -> HookContext<'_> {
     HookContext {
         session_id,
         namespace,
+        branch_tag,
     }
 }
 
@@ -132,7 +137,8 @@ fn extract_hook_context(payload: &serde_json::Value) -> HookContext<'_> {
 /// "compact" (checkpoint + full context), "clear" (treated like startup).
 pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
     let source = payload
         .get("source")
         .and_then(|v| v.as_str())
@@ -140,7 +146,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
 
     // Auto-start a session for this project
     if !ctx.session_id.is_empty() {
-        if let Err(e) = storage.start_session(ctx.session_id, ctx.namespace) {
+        if let Err(e) = storage.start_session(ctx.session_id, ctx.namespace.as_deref()) {
             tracing::warn!("Failed to start session {}: {e}", ctx.session_id);
         }
     }
@@ -160,7 +166,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
 
     // On "compact", save a checkpoint before context is lost
     if source == "compact" {
-        save_compact_checkpoint(storage, ctx.session_id, ctx.namespace);
+        save_compact_checkpoint(storage, ctx.session_id, ctx.namespace.as_deref());
     }
 
     let namespace = ctx.namespace;
@@ -169,7 +175,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
     let mut sections: Vec<String> = Vec::new();
 
     // 1. Recent sessions with summaries
-    if let Ok(sessions) = storage.list_sessions(namespace, usize::MAX) {
+    if let Ok(sessions) = storage.list_sessions(namespace.as_deref(), usize::MAX) {
         let with_summaries: Vec<_> = sessions
             .iter()
             .filter(|s| s.summary.is_some() && s.ended_at.is_some())
@@ -193,7 +199,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
     }
 
     // 2. Recent Decision and Insight memories (highest signal)
-    let memory_ids = if let Some(ns) = namespace {
+    let memory_ids = if let Some(ref ns) = namespace {
         storage
             .list_memory_ids_for_namespace(ns)
             .unwrap_or_default()
@@ -244,7 +250,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
     }
 
     // 3. File hotspots (most frequently touched files)
-    if let Ok(hotspots) = storage.get_file_hotspots(5, namespace) {
+    if let Ok(hotspots) = storage.get_file_hotspots(5, namespace.as_deref()) {
         if !hotspots.is_empty() {
             let mut sec = String::from("### File Hotspots\n\n");
             for (path, count, _ids) in &hotspots {
@@ -260,7 +266,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
 
     // 4. Detected patterns
     let mut pattern_items: Vec<String> = Vec::new();
-    if let Ok(searches) = storage.get_repeated_searches(3, namespace) {
+    if let Ok(searches) = storage.get_repeated_searches(3, namespace.as_deref()) {
         for (pattern, count, _ids) in searches.iter().take(3) {
             pattern_items.push(format!(
                 "- Repeated search: \"{}\" ({} times)",
@@ -279,7 +285,7 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
     }
 
     // 4b. Pending analysis from file changes
-    let pending_ids = if let Some(ns) = namespace {
+    let pending_ids = if let Some(ref ns) = namespace {
         storage
             .list_memory_ids_for_namespace(ns)
             .unwrap_or_default()
@@ -365,7 +371,8 @@ pub(crate) fn cmd_context(storage: &dyn StorageBackend) -> anyhow::Result<()> {
 /// UserPromptSubmit hook: record the user's prompt as a Context memory.
 pub(crate) fn cmd_prompt() -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
 
     let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     let session_id = if ctx.session_id.is_empty() {
@@ -373,7 +380,8 @@ pub(crate) fn cmd_prompt() -> anyhow::Result<()> {
     } else {
         Some(ctx.session_id)
     };
-    let cwd = ctx.namespace;
+    let namespace = ctx.namespace;
+    let branch_tag = ctx.branch_tag;
 
     // Skip empty or very short prompts
     if prompt.len() < 5 {
@@ -395,7 +403,7 @@ pub(crate) fn cmd_prompt() -> anyhow::Result<()> {
     // Auto-start session if needed
     if let Some(sid) = session_id {
         if !sid.is_empty() {
-            if let Err(e) = storage.start_session(sid, cwd) {
+            if let Err(e) = storage.start_session(sid, namespace.as_deref()) {
                 tracing::warn!("Failed to start session {sid}: {e}");
             }
         }
@@ -415,7 +423,11 @@ pub(crate) fn cmd_prompt() -> anyhow::Result<()> {
 
     let mut memory = codemem_core::MemoryNode::new(content, codemem_core::MemoryType::Context);
     memory.importance = 0.3;
-    memory.tags = vec!["prompt".to_string()];
+    let mut tags = vec!["prompt".to_string()];
+    if let Some(ref bt) = branch_tag {
+        tags.push(bt.clone());
+    }
+    memory.tags = tags;
     memory.metadata = {
         let mut m = std::collections::HashMap::new();
         m.insert(
@@ -430,7 +442,7 @@ pub(crate) fn cmd_prompt() -> anyhow::Result<()> {
         }
         m
     };
-    memory.namespace = cwd.map(|s| s.to_string());
+    memory.namespace = namespace;
 
     // Use the engine's persist_memory pipeline for consistent indexing
     match codemem_engine::CodememEngine::from_db_path(&db_path) {
@@ -474,7 +486,8 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
     let last_message = payload
         .get("last_assistant_message")
         .and_then(|v| v.as_str())
@@ -488,6 +501,7 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
 
     let session_id = ctx.session_id;
     let namespace = ctx.namespace;
+    let branch_tag = ctx.branch_tag;
 
     let db_path = super::codemem_db_path();
     let storage = match codemem_engine::Storage::open_without_migrations(&db_path) {
@@ -502,7 +516,7 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
     // Look up session start time to filter memories by creation time.
     // Use UFCS to call the trait method (2-arg) instead of the concrete 1-arg
     // convenience method, so this code would survive a refactor to &dyn StorageBackend.
-    let session_start = StorageBackend::list_sessions(&storage, namespace, usize::MAX)
+    let session_start = StorageBackend::list_sessions(&storage, namespace.as_deref(), usize::MAX)
         .unwrap_or_default()
         .into_iter()
         .find(|s| s.id == session_id)
@@ -510,7 +524,7 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
         .unwrap_or_else(chrono::Utc::now);
 
     // Collect all memories created during this session
-    let all_ids = if let Some(ns) = namespace {
+    let all_ids = if let Some(ref ns) = namespace {
         storage
             .list_memory_ids_for_namespace(ns)
             .unwrap_or_default()
@@ -569,7 +583,11 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
             codemem_core::MemoryType::Insight,
         );
         summary_memory.importance = 0.7;
-        summary_memory.tags = vec!["session-summary".to_string()];
+        let mut summary_tags = vec!["session-summary".to_string()];
+        if let Some(ref bt) = branch_tag {
+            summary_tags.push(bt.clone());
+        }
+        summary_memory.tags = summary_tags;
         summary_memory.metadata = {
             let mut m = std::collections::HashMap::new();
             m.insert(
@@ -590,7 +608,7 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
             );
             m
         };
-        summary_memory.namespace = namespace.map(|s| s.to_string());
+        summary_memory.namespace = namespace.clone();
         // Use the engine's persist_memory pipeline for consistent indexing
         let result = match &engine {
             Some(eng) => eng.persist_memory(&summary_memory),
@@ -611,7 +629,11 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
         let mut change_memory =
             codemem_core::MemoryNode::new(change_content, codemem_core::MemoryType::Context);
         change_memory.importance = 0.4;
-        change_memory.tags = vec!["pending-analysis".to_string(), "file-changes".to_string()];
+        let mut change_tags = vec!["pending-analysis".to_string(), "file-changes".to_string()];
+        if let Some(ref bt) = branch_tag {
+            change_tags.push(bt.clone());
+        }
+        change_memory.tags = change_tags;
         change_memory.metadata = {
             let mut m = std::collections::HashMap::new();
             m.insert("session_id".into(), serde_json::json!(session_id));
@@ -622,7 +644,7 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
             );
             m
         };
-        change_memory.namespace = namespace.map(|s| s.to_string());
+        change_memory.namespace = namespace.clone();
         // Use the engine's persist_memory pipeline for consistent indexing
         let result = match &engine {
             Some(eng) => eng.persist_memory(&change_memory),
@@ -654,7 +676,8 @@ pub(crate) fn cmd_summarize() -> anyhow::Result<()> {
 /// SubagentStop hook: capture subagent findings from `last_assistant_message`.
 pub(crate) fn cmd_agent_result() -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
 
     // Skip if stop_hook_active (avoid loops)
     if payload
@@ -702,7 +725,11 @@ pub(crate) fn cmd_agent_result() -> anyhow::Result<()> {
 
     let mut memory = codemem_core::MemoryNode::new(content, codemem_core::MemoryType::Insight);
     memory.importance = 0.5;
-    memory.tags = vec!["agent-result".to_string(), format!("agent:{agent_type}")];
+    let mut tags = vec!["agent-result".to_string(), format!("agent:{agent_type}")];
+    if let Some(ref bt) = ctx.branch_tag {
+        tags.push(bt.clone());
+    }
+    memory.tags = tags;
     memory.metadata = {
         let mut m = std::collections::HashMap::new();
         m.insert("source".into(), serde_json::json!("SubagentStop"));
@@ -715,7 +742,7 @@ pub(crate) fn cmd_agent_result() -> anyhow::Result<()> {
         }
         m
     };
-    memory.namespace = ctx.namespace.map(|s| s.to_string());
+    memory.namespace = ctx.namespace;
 
     if let Err(e) = storage.insert_memory(&memory) {
         tracing::warn!("Failed to persist agent result: {e}");
@@ -751,7 +778,8 @@ pub(crate) fn cmd_agent_start() -> anyhow::Result<()> {
 /// PostToolUseFailure hook: capture tool error patterns.
 pub(crate) fn cmd_tool_error() -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
 
     // Skip user interrupts — not a real error
     if payload
@@ -806,11 +834,15 @@ pub(crate) fn cmd_tool_error() -> anyhow::Result<()> {
 
     let mut memory = codemem_core::MemoryNode::new(content, codemem_core::MemoryType::Context);
     memory.importance = 0.4;
-    memory.tags = vec![
+    let mut tags = vec![
         "error".to_string(),
         "tool-failure".to_string(),
         format!("tool:{tool_name}"),
     ];
+    if let Some(ref bt) = ctx.branch_tag {
+        tags.push(bt.clone());
+    }
+    memory.tags = tags;
     memory.metadata = {
         let mut m = std::collections::HashMap::new();
         m.insert("source".into(), serde_json::json!("PostToolUseFailure"));
@@ -824,7 +856,7 @@ pub(crate) fn cmd_tool_error() -> anyhow::Result<()> {
         }
         m
     };
-    memory.namespace = ctx.namespace.map(|s| s.to_string());
+    memory.namespace = ctx.namespace;
 
     if let Err(e) = storage.insert_memory(&memory) {
         tracing::warn!("Failed to persist tool error: {e}");
@@ -837,7 +869,8 @@ pub(crate) fn cmd_tool_error() -> anyhow::Result<()> {
 /// SessionEnd hook: cleanly close the session with the termination reason.
 pub(crate) fn cmd_session_close() -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
 
     let reason = payload
         .get("reason")
@@ -860,10 +893,11 @@ pub(crate) fn cmd_session_close() -> anyhow::Result<()> {
 
     // Check if the Stop hook already ended this session with a rich summary.
     // If so, skip to avoid overwriting it with a terse "Session ended: {reason}".
-    let already_ended = StorageBackend::list_sessions(&storage, ctx.namespace, usize::MAX)
-        .unwrap_or_default()
-        .iter()
-        .any(|s| s.id == ctx.session_id && s.ended_at.is_some());
+    let already_ended =
+        StorageBackend::list_sessions(&storage, ctx.namespace.as_deref(), usize::MAX)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.id == ctx.session_id && s.ended_at.is_some());
 
     if !already_ended {
         let summary = format!("Session ended: {reason}");
@@ -879,7 +913,8 @@ pub(crate) fn cmd_session_close() -> anyhow::Result<()> {
 /// PreCompact hook: save a checkpoint memory before context compaction.
 pub(crate) fn cmd_checkpoint() -> anyhow::Result<()> {
     let payload = read_hook_payload();
-    let ctx = extract_hook_context(&payload);
+    let config = CodememConfig::load_or_default();
+    let ctx = extract_hook_context(&payload, &config);
 
     let db_path = super::codemem_db_path();
     let storage = match codemem_engine::Storage::open_without_migrations(&db_path) {
@@ -890,7 +925,7 @@ pub(crate) fn cmd_checkpoint() -> anyhow::Result<()> {
         }
     };
 
-    save_compact_checkpoint(&storage, ctx.session_id, ctx.namespace);
+    save_compact_checkpoint(&storage, ctx.session_id, ctx.namespace.as_deref());
 
     println!("{{}}");
     Ok(())
