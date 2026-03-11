@@ -35,6 +35,15 @@ pub(crate) fn cmd_config_set(key: &str, value: &str) -> anyhow::Result<()> {
     let config_path = CodememConfig::default_path();
     config.save(&config_path)?;
     eprintln!("Updated {key} and saved to {}", config_path.display());
+
+    // Hint when enabling git-aware namespaces: existing memories keep old names.
+    if key == "namespace.git_aware" && value.trim() == "true" {
+        eprintln!(
+            "\nNote: Existing memories still use their old namespace.\n\
+             Run `codemem namespace rename <old> <new>` to migrate them."
+        );
+    }
+
     Ok(())
 }
 
