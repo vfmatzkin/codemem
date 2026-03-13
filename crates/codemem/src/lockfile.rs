@@ -28,7 +28,11 @@ pub fn try_acquire(namespace: &str) -> Result<IndexLock, String> {
     let dir = lock_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create lock dir: {e}"))?;
 
-    let path = dir.join(format!("{namespace}.lock"));
+    let safe_name: String = namespace
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{safe_name}.lock"));
 
     try_create_lock(&path, namespace)
 }
@@ -79,7 +83,10 @@ fn lock_dir() -> PathBuf {
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
     // kill(pid, 0) checks existence without sending a signal
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    match i32::try_from(pid) {
+        Ok(pid_i32) => unsafe { libc::kill(pid_i32, 0) == 0 },
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(unix))]
