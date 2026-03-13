@@ -1,15 +1,11 @@
 //! Cross-process lockfile to prevent concurrent index operations on the same namespace.
-//!
-//! Lock files live at `~/.codemem/locks/{namespace}.lock` and contain the PID of
-//! the owning process. Uses `O_CREAT | O_EXCL` (via `create_new`) for atomic
-//! creation, avoiding the TOCTOU race of check-then-create. Stale locks (dead PID)
-//! are reclaimed with a remove-and-retry.
+//! Lock files live at `~/.codemem/locks/{namespace}.lock` and contain the owner PID.
+//! Uses `O_CREAT | O_EXCL` for atomic creation; stale locks (dead PID) are reclaimed.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// RAII guard that removes the lock file on drop.
 pub struct IndexLock {
     path: PathBuf,
 }
@@ -20,10 +16,8 @@ impl Drop for IndexLock {
     }
 }
 
-/// Try to acquire an exclusive index lock for the given namespace.
-///
-/// Returns `Ok(guard)` on success. The lock is released when the guard is dropped.
-/// Returns `Err` if another live process holds the lock.
+/// Acquire an exclusive index lock for `namespace`. Returns a guard that releases
+/// the lock on drop. Errors if another live process holds the lock.
 pub fn try_acquire(namespace: &str) -> Result<IndexLock, String> {
     let dir = lock_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create lock dir: {e}"))?;
@@ -37,14 +31,10 @@ pub fn try_acquire(namespace: &str) -> Result<IndexLock, String> {
     try_create_lock(&path, namespace)
 }
 
-/// Atomically create the lock file. If it already exists, inspect the PID:
-/// - alive  → return Err (another process is indexing)
-/// - dead   → remove stale lock and retry once
-fn try_create_lock(path: &PathBuf, namespace: &str) -> Result<IndexLock, String> {
+fn try_create_lock(path: &std::path::Path, namespace: &str) -> Result<IndexLock, String> {
     match write_lock_atomic(path) {
-        Ok(()) => Ok(IndexLock { path: path.clone() }),
+        Ok(()) => Ok(IndexLock { path: path.to_path_buf() }),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lock exists — check if the owning PID is still alive
             let contents = fs::read_to_string(path).unwrap_or_default();
             let pid = contents.trim().parse::<u32>().unwrap_or(0);
 
@@ -56,18 +46,16 @@ fn try_create_lock(path: &PathBuf, namespace: &str) -> Result<IndexLock, String>
                 ));
             }
 
-            // Stale lock — remove and retry once
             let _ = fs::remove_file(path);
             write_lock_atomic(path)
-                .map(|()| IndexLock { path: path.clone() })
+                .map(|()| IndexLock { path: path.to_path_buf() })
                 .map_err(|e| format!("Failed to acquire lock after stale removal: {e}"))
         }
         Err(e) => Err(format!("Failed to create lock file {}: {e}", path.display())),
     }
 }
 
-/// Write PID to the lock file using `create_new` (O_CREAT | O_EXCL) for atomicity.
-fn write_lock_atomic(path: &PathBuf) -> std::io::Result<()> {
+fn write_lock_atomic(path: &std::path::Path) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
     write!(f, "{}", std::process::id())?;
     Ok(())
@@ -82,7 +70,6 @@ fn lock_dir() -> PathBuf {
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks existence without sending a signal
     match i32::try_from(pid) {
         Ok(pid_i32) => unsafe { libc::kill(pid_i32, 0) == 0 },
         Err(_) => false,
@@ -91,6 +78,5 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(not(unix))]
 fn is_process_alive(_pid: u32) -> bool {
-    // Conservative: assume alive on non-unix to avoid clobbering
     true
 }
